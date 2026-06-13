@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 import requests
 
 from .config import (
+    CACHE_FRESH_DAYS,
     FINMIND_CACHE_DIR,
     FINMIND_URL,
     FINMIND_MIN_INTERVAL,
@@ -106,3 +108,118 @@ def _rate_limited_get(params: dict, timeout: int, max_retries: int) -> dict:
             continue
         resp.raise_for_status()
         return resp.json()
+
+
+def _freq_of(dataset: str) -> str:
+    if dataset == "TaiwanStockMonthRevenue":
+        return "monthly"
+    if dataset == "TaiwanStockShareholding":
+        return "weekly"
+    if dataset == "TaiwanStockInfo":
+        return "static"
+    return "daily"
+
+
+def _read_cache(dataset: str, data_id: str) -> pd.DataFrame | None:
+    p = cache_path(dataset, data_id)
+    if not p.exists():
+        return None
+    try:
+        return pd.read_parquet(p)
+    except Exception:
+        # 損毀 → 刪檔重抓
+        p.unlink(missing_ok=True)
+        _meta_path(dataset, data_id).unlink(missing_ok=True)
+        return None
+
+
+def _write_cache(dataset: str, data_id: str, df: pd.DataFrame) -> None:
+    p = cache_path(dataset, data_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(p, index=False)
+    meta = {
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "min_date": str(df["date"].min()) if "date" in df and len(df) else None,
+        "max_date": str(df["date"].max()) if "date" in df and len(df) else None,
+        "rows": int(len(df)),
+    }
+    _meta_path(dataset, data_id).write_text(json.dumps(meta))
+
+
+def _is_fresh(dataset: str, data_id: str, fresh_days: int | None) -> bool:
+    mp = _meta_path(dataset, data_id)
+    if not mp.exists():
+        return False
+    try:
+        meta = json.loads(mp.read_text())
+        max_date = pd.to_datetime(meta.get("max_date"))
+    except Exception:
+        return False
+    if pd.isna(max_date):
+        return False
+    days = fresh_days if fresh_days is not None else CACHE_FRESH_DAYS[_freq_of(dataset)]
+    return (pd.Timestamp.now().normalize() - max_date.normalize()).days <= days
+
+
+def _api_to_df(payload: dict) -> pd.DataFrame:
+    df = pd.DataFrame(payload.get("data", []))
+    if not df.empty and "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    return df
+
+
+def fetch_finmind_cached(
+    dataset: str,
+    data_id: str,
+    start_date: str,
+    end_date: str | None = None,
+    *,
+    fresh_days: int | None = None,
+    force_refresh: bool = False,
+    timeout: int = 30,
+    max_retries: int = 2,
+) -> pd.DataFrame:
+    """帶 parquet 快取 + 限流退避的 FinMind 取數。
+
+    - 命中新鮮快取 → 直接回（不打 API）
+    - 過期 → 增量抓 max_date 之後並合併去重
+    - 冷啟動 → 全抓並寫快取
+    回傳已正規化 date（datetime64）、升冪排序、去重後的 DataFrame；
+    最後依 [start_date, end_date] 切片（end_date 杜絕抓進未來）。
+    """
+    cached = None if force_refresh else _read_cache(dataset, data_id)
+
+    if cached is not None and not force_refresh and _is_fresh(dataset, data_id, fresh_days):
+        df = cached
+    else:
+        params = {
+            "dataset": dataset,
+            "data_id": data_id,
+            "start_date": start_date,
+            "token": __import__("os").environ.get("FINMIND_TOKEN", ""),
+        }
+        # 增量：有舊快取則只抓 max_date 之後（留 7 天 overlap 去重）
+        if cached is not None and len(cached) and "date" in cached.columns:
+            inc_start = (cached["date"].max() - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
+            params["start_date"] = min(start_date, inc_start)
+        payload = _rate_limited_get(params, timeout=timeout, max_retries=max_retries)
+        fresh = _api_to_df(payload)
+        if cached is not None and len(cached):
+            df = pd.concat([cached, fresh], ignore_index=True)
+            if "date" in df.columns:
+                df = df.drop_duplicates(subset=[c for c in df.columns]).sort_values("date")
+                df = df.drop_duplicates(subset=["date"] + (["data_id"] if "data_id" in df else []), keep="last")
+        else:
+            df = fresh
+        df = df.reset_index(drop=True)
+        if len(df):
+            _write_cache(dataset, data_id, df)
+
+    # 切片
+    if "date" in df.columns and len(df):
+        df = df[df["date"] >= pd.to_datetime(start_date)]
+        if end_date:
+            df = df[df["date"] <= pd.to_datetime(end_date)]
+        df = df.sort_values("date").reset_index(drop=True)
+    return df
