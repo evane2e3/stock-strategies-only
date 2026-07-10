@@ -1,5 +1,9 @@
 # 📈 台股每日選股機器人
 
+<p align="center">
+  <img src="assets/readme_banner.png" alt="台股每日選股機器人 Banner" width="100%" />
+</p>
+
 - TODO: 嚴謹回測機制
 
 > ✅ **現有版本穩定、開箱即用** — 每日選股、🌙 夜盤盤前快報、策略庫 Web UI 全部正常運作，`uv run python main.py` 直接跑即可，不需要任何額外設定。
